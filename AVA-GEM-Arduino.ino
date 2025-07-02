@@ -1,124 +1,136 @@
+#include <Arduino.h>
 #include "AudioTools.h"
 #include "BluetoothA2DPSink.h"
-#include <WiFi.h>
+#include <array>
 
 I2SStream i2s;
 BluetoothA2DPSink a2dp_sink(i2s);
 
-// WiFi credentials
-const char* ssid = "Google";
-const char* password = "123ggg123";
-
-// NTP
-const char* ntpServer = "pool.ntp.org";
-const long gmtOffset_sec = 0;
-const int daylightOffset_sec = 0;
-
 // Motor pin assignments
-const int left_front = 16;
-const int left_back  = 17;
-const int right_front = 18;
-const int right_back  = 19;
+const int motor_pins[4] = {16, 19, 17, 18}; // left_front, left_back, right_front, right_back
+int motor_status[4] = {0, 0, 0, 0};
+int motor_strength = 0;
+int frequency = 0;       // in Hz
+int duty_cycle = 0;      // percentage [0-100]
+int t1 = 0;              // off duration (ms)
+int t2 = 0;              // on duration (ms)
+int metadata_count = 0;
 
-int count=0;
+// Non-blocking timing
+unsigned long previousMillis = 0;
+bool motorsOn = false;
 
-// Function declarations
+// Forward declarations
 void avrc_metadata_callback(uint8_t id, const uint8_t *text);
-bool parse_text(const uint8_t *text, int vals[4]);
-void setMotors(int vals[4]);
+bool parse_text(const uint8_t *text);
+void calc_timing();
+std::array<int, 4> calc_motor_vals();
+void set_motors(const std::array<int, 4> &vals);
 
 void avrc_metadata_callback(uint8_t id, const uint8_t *text) {
-  // Serial.println("we are receiving metadata!");
   Serial.printf("==> AVRC metadata rsp: attribute id 0x%x, %s\n", id, text);
-  int vals[4] = {0, 0, 0, 0};
-  if (parse_text(text, vals)) {
-    setMotors(vals);
-    Serial.print("metadata parsed!");
-    Serial.println(count);
-    count++;
-  } else {
-    // Serial.println("Failed to parse metadata.");
+  if (parse_text(text)) {
+    calc_timing();
+    Serial.print("metadata parsed! count=");
+    Serial.println(metadata_count);
+    metadata_count++;
   }
 }
-void calc_latency(const uint8_t *text){
-  const char* timeStr = (const char*) text;
-  uint64_t phoneTime = strtoull(timeStr, NULL, 10);
 
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  uint64_t esp32Time = (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
-
-  long latency = esp32Time - phoneTime;
-
-  Serial.print("Latency: ");
-  Serial.println(latency);
-}
-bool parse_text(const uint8_t *text, int vals[4]) {
-  // Convert the incoming data to a string pointer.
+bool parse_text(const uint8_t *text) {
   const char *str = reinterpret_cast<const char *>(text);
-  // Expect four integer values. The format specifier for int is "%d".
-  int count = sscanf(str, "%d %d %d %d", &vals[0], &vals[1], &vals[2], &vals[3]);
-  return (count == 4);
+  int cnt = sscanf(str,
+                   "%d %d %d %d %d %d %d",
+                   &motor_status[0], &motor_status[1],
+                   &motor_status[2], &motor_status[3],
+                   &motor_strength, &frequency, &duty_cycle);
+
+  Serial.print("motor_strength: ");
+  Serial.println(motor_strength);
+    Serial.print("frequency: ");
+  Serial.println(frequency);
+    Serial.print("duty_cycle: ");
+  Serial.println(duty_cycle);
+  return (cnt == 7);
 }
 
-void setMotors(int vals[4]) {
-  // Convert the parsed double values to integers within a PWM range of 0-255.
-  int lf = constrain(vals[0], 0, 255);
-  int lb = constrain(vals[1], 0, 255);
-  int rf = constrain(vals[2], 0, 255);
-  int rb = constrain(vals[3], 0, 255);
-  
-  analogWrite(left_front, lf);
-  analogWrite(left_back,  lb);
-  analogWrite(right_front, rf);
-  analogWrite(right_back,  rb);
-  
-  Serial.print("Left Front: ");
-  Serial.println(lf);
-  Serial.print("Left Back: ");
-  Serial.println(lb);
-  Serial.print("Right Front: ");
-  Serial.println(rf);
-  Serial.print("Right Back: ");
-  Serial.println(rb);
+void calc_timing() {
+  if (frequency <= 0 || duty_cycle <= 0) {
+    t1 = 1;
+    t2 = 0;
+    Serial.print("t1: ");
+    Serial.println(t1);
+    Serial.print("t2: ");
+    Serial.println(t2);
+    return;
+  }
+  float period_ms = 1000.0f / frequency;
+  t2 = period_ms * (duty_cycle / 100.0f);
+  t1 = period_ms - t2;
+  Serial.print("t1: ");
+  Serial.println(t1);
+  Serial.print("t2: ");
+  Serial.println(t2);
+}
+
+std::array<int, 4> calc_motor_vals() {
+  std::array<int, 4> vals;
+  for (int i = 0; i < 4; i++) {
+    vals[i] = constrain(motor_status[i] * motor_strength, 0, 255);
+  }
+  return vals;
+}
+
+void set_motors(const std::array<int, 4> &vals) {
+  static const char *motor_names[4] = {"left front", "left back", "right front", "right back"};
+  for (int i = 0; i < 4; i++) {
+    analogWrite(motor_pins[i], vals[i]);
+    // Serial.print(motor_names[i]);
+    // Serial.print(": ");
+    // Serial.println(vals[i]);
+  }
 }
 
 void setup() {
   Serial.begin(115200);
-  // connect_wifi();
+  for (int i = 0; i < 4; i++) {
+    pinMode(motor_pins[i], OUTPUT);
+  }
 
-  // Initialize motor pins as outputs.
-  pinMode(left_front, OUTPUT);
-  pinMode(left_back,  OUTPUT);
-  pinMode(right_front, OUTPUT);
-  pinMode(right_back,  OUTPUT);
+  // I2S configuration
+  auto cfg = i2s.defaultConfig(TX_MODE);
+  cfg.i2s_format = I2S_STD_FORMAT;
+  cfg.pin_bck = 14;
+  cfg.pin_ws  = 15;
+  cfg.pin_data = 22;
+  i2s.begin(cfg);
 
-    auto cfg = i2s.defaultConfig(TX_MODE);
-    cfg.i2s_format = I2S_STD_FORMAT;
-
-    cfg.pin_bck = 14;
-    cfg.pin_ws = 15;
-    cfg.pin_data = 22;
-    i2s.begin(cfg);
-  a2dp_sink.set_avrc_metadata_attribute_mask(ESP_AVRC_MD_ATTR_TITLE);
+  // Bluetooth A2DP setup
+  a2dp_sink.set_avrc_metadata_attribute_mask(
+      ESP_AVRC_MD_ATTR_TITLE);
   a2dp_sink.set_avrc_metadata_callback(avrc_metadata_callback);
   a2dp_sink.start("AVA-GEM");
-}
 
-void connect_wifi(){
-  // Connect to WiFi
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("WiFi connected");
-  // Init and get the time
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  // Initialize timing reference
+  previousMillis = millis();
+  motorsOn = false;
+  set_motors({0, 0, 0, 0});
 }
 
 void loop() {
-  // No recurring operations needed.
-  // Serial.println("1 sec passed");
-  // delay(1000);
+  unsigned long currentMillis = millis();
+  unsigned long interval = motorsOn ? t2 : t1;
+
+  // Check if it's time to toggle motor state
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+    motorsOn = !motorsOn;
+  }
+  if (motorsOn) {
+      set_motors(calc_motor_vals());
+      Serial.println("motors_on");
+    } else {
+      set_motors({0, 0, 0, 0});
+      Serial.println("motors_off");
+    }
 }
